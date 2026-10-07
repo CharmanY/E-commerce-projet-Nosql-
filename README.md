@@ -4,11 +4,10 @@ Projet du cours NoSQL (EFREI, M1 Data Engineering & AI).
 
 ## Équipe
 
-| Nom| GitHub |
-|---|---|---|
+| Nom | GitHub |
+|---|---|
 | Loïc AKAMGA | @LOIC754 |
-| Deiss YEHOUENOU | CharmanY|
-| 
+| Deiss YEHOUENOU | CharmanY |
 
 ## Objectif
 
@@ -65,6 +64,26 @@ flowchart LR
 **Clickstream : colonnes larges.** Volume d'écritures élevé et lectures par plage de clés sur des séries temporelles.
 
 **Recommandation : graphe.** Les requêtes portent sur les relations (achetés ensemble, parrainage), coûteuses à exprimer en jointures.
+
+## Agrégats
+
+Un agrégat est un ensemble de données liées, identifié par une clé, lu et écrit d'un seul bloc. C'est la frontière de l'atomicité.
+
+| Agrégat | Base | Clé | Contenu |
+|---|---|---|---|
+| Produit | MongoDB | id produit | Nom, prix, catégorie, vendeur, attributs propres à la catégorie, stock de référence, note moyenne |
+| Avis | MongoDB | id avis | Référence produit, référence client, note, texte, date |
+| Commande | MongoDB | id commande | Lignes de commande, adresse, paiement, statut |
+| Client | MongoDB | id client | Profil, adresses |
+| Panier | Redis | `panier:{client}` | Couples produit/quantité, avec expiration |
+| Stock temps réel | Redis | `stock:{produit}` | Un compteur |
+| Événement de navigation | Bigtable | `client#timestamp_inversé` | Type d'événement, produit, page, appareil |
+| Point de prix | Bigtable | `produit#timestamp` | Prix, vendeur |
+
+- **Avis séparé du produit** : le nombre d'avis n'est pas borné, le produit ne garde que la note moyenne.
+- **Bigtable** : l'agrégat est la ligne, seule unité atomique.
+- **Neo4j** : aucun agrégat, la base ne stocke que les identifiants des clients et produits et leurs relations.
+- **Classement des ventes et cache Redis** : données dérivées, pas des agrégats métier.
 
 ## Modèle de données
 
