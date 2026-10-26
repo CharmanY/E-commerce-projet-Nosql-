@@ -1,0 +1,35 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: shop-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data                      # persistance sur volume nommé
+    # AOF activé + noeviction pour ne jamais perdre les files d'événements
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+    networks: [shop-network]
+
+  mongodb:
+    image: mongo:7
+    container_name: shop-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db                   # persistance MongoDB
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      retries: 6
+    networks: [shop-network]
+
+volumes:
+  redis-data:
+  mongo-data:
+
+networks:
+  shop-network:

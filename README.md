@@ -1,170 +1,338 @@
-# Plateforme e-commerce NoSQL
+# E-commerce Cloud Native – Projet NoSQL
 
-Projet du cours NoSQL (EFREI, M1 Data Engineering & AI).
+Projet de groupe du cours **NoSQL – M1 Data Engineering & IA (EFREI Paris)**.
+Conception d'une marketplace e-commerce cloud native composée de plusieurs services découplés par événements.
 
-| Nom | GitHub |
+## Équipe
+
+| Membre | GitHub |
 |---|---|
-| Loïc AKAMGA | @LOIC754 |
-| Deiss YEHOUENOU | CharmanY |
+| Loïc AKAMGA | [@LOIC754](https://github.com/LOIC754) |
+| Deiss YEHOUENOU | [@CharmanY](https://github.com/CharmanY) |
 
-## Architecture
+---
 
-Trois services, un agrégat chacun. Le client envoie une commande en REST ; les services se coordonnent ensuite par événements (saga chorégraphiée).
+## Sommaire
 
-```mermaid
-flowchart LR
-    C[Client] -->|commande REST| O[Service Commande]
-    O --> ODB[(Agrégat Commande<br/>PostgreSQL)]
-    S[Service Stock] --> SDB[(Agrégat Stock<br/>PostgreSQL)]
-    L[Service Livraison] --> LDB[(Agrégat Livraison<br/>PostgreSQL)]
-    O & S & L -->|événements| P[[Redis List publiée]]
-    P --> R[Routeur]
-    R -->|une List par consommateur| O & S & L
-    R -.-> V[Projecteur]
-    V --> M[(MongoDB)] & B[(Bigtable)] & N[(Neo4j)] & K[(Redis clé-valeur)]
-```
+1. [Étape 1 – Initialisation du projet](#étape-1--initialisation-du-projet)
+2. [Étape 2 – Les services](#étape-2--les-services)
+3. [Étape 3 – Les agrégats](#étape-3--les-agrégats)
+4. [Étape 4 – Découplage par événements et réplica](#étape-4--découplage-par-événements-et-réplica)
+5. [Étape 5 – Projection](#étape-5--projection)
+6. [Stockage des agrégats dans Redis](#stockage-des-agrégats-dans-redis)
+7. [Gestion de la survente](#gestion-de-la-survente)
+8. [Persistance de Redis](#persistance-de-redis)
+9. [Lancer le projet](#lancer-le-projet)
+10. [Arborescence](#arborescence)
 
-## Services et agrégats
+---
 
-| Service | Agrégat | Rôle | Émet | Reçoit |
-|---|---|---|---|---|
-| Commande | Commande | Enregistrer et suivre les commandes | `OrderPlaced`, `OrderConfirmed`, `OrderCancelled` | `StockReserved`, `StockRejected`, `DeliveryShipped`, `DeliveryCompleted` |
-| Stock | Stock | Ne jamais vendre plus que le disponible | `StockReserved`, `StockRejected` | `OrderPlaced`, `OrderCancelled` |
-| Livraison | Livraison | Acheminer la commande | `DeliveryShipped`, `DeliveryCompleted` | `OrderConfirmed`, `OrderCancelled` |
+## Étape 1 – Initialisation du projet
 
-## Commandes REST (points d'entrée des données)
+- Équipe de 2 personnes.
+- Dépôt Git créé, enseignant invité.
+- Descriptif du projet : ce README.
 
-| Service | Commandes | Appelant |
+**Problème métier traité** : un client passe une commande sur une marketplace. La commande doit être validée par rapport au stock disponible, **sans survente** (exemple : un client commande 10 articles alors qu'il n'en reste que 3), puis être livrée.
+
+---
+
+## Étape 2 – Les services
+
+L'application est découpée en services. Chaque service **possède son propre agrégat** et ne lit jamais les données d'un autre service directement.
+
+| Service | Responsabilité | Agrégat possédé |
 |---|---|---|
-| Commande | Passer une commande, annuler une commande | Client |
-| Stock | Créer un produit, réapprovisionner | Administrateur |
-| Livraison | Expédier, livrer | Transporteur |
+| **Commande** (`orderService`) | reçoit la commande du client, émet les événements de commande | Commande |
+| **Stock** (`stockService`) | réserve les articles et empêche la survente | Stock |
+| **Livraison** (`deliveryService`) | prépare et expédie la commande à partir d'un réplica | Livraison (+ réplica Commande) |
+| **Query** (`orderQueryService`) | construit une vue consolidée pour l'affichage client | Projection `order_views` |
 
-## Événements
+### Architecture
+![Architecture de l'application](images/architecture.png)
 
-Champs communs : `eventId`, `eventType`, `eventVersion`, `orderId`, horodatage.
+Comme dans le projet de l'enseignant, **Redis coordonne la livraison des événements** entre services. Le routeur copie chaque événement dans **une file par service consommateur**, car une List Redis est consommée de façon destructive (`LPOP` / `LMOVE`) : avec une file partagée, un événement ne serait reçu que par un seul service.
 
-| Événement | Émetteur | Récepteur | Données | Effet |
+---
+
+## Étape 3 – Les agrégats
+
+Un agrégat est une frontière transactionnelle métier : il est modifié en une seule opération par le service qui le possède.
+
+### Agrégat Commande
+
+```json
+{
+  "orderId": "CMD-42",
+  "customerId": "CLI-7",
+  "lines": [
+    { "productId": "PROD-12", "quantity": 10 }
+  ],
+  "deliveryAddress": "12 rue de Paris, 94120 Fontenay",
+  "total": 250,
+  "status": "PENDING"
+}
+```
+
+Statuts possibles : `PENDING` → `CONFIRMED` ou `REJECTED` → `SHIPPED`.
+
+### Agrégat Stock
+
+```json
+{
+  "productId": "PROD-12",
+  "available": 3,
+  "reserved": 0
+}
+```
+
+### Agrégat Livraison
+
+```json
+{
+  "deliveryId": "LIV-43",
+  "orderId": "CMD-43",
+  "carrier": "",
+  "status": "WAITING"
+}
+```
+
+Statuts possibles : `WAITING` → `SHIPPED`.
+
+---
+
+## Étape 4 – Découplage par événements et réplica
+
+### Enveloppe commune des événements
+
+```json
+{
+  "eventId": "uuid",
+  "type": "OrderCreated",
+  "version": 1,
+  "occurredAt": "2026-10-26T12:00:00Z",
+  "aggregateId": "CMD-42",
+  "payload": {}
+}
+```
+
+Le champ `eventId` sert à l'**idempotence** : chaque service enregistre les `eventId` déjà traités pour ignorer un événement reçu deux fois.
+
+### Liste des événements
+
+| Événement | Émetteur | Récepteurs | Donnée modifiée | Nouvelle valeur |
 |---|---|---|---|---|
-| `OrderPlaced v1` | Commande | Stock | `productId`, quantité | Tente la réservation |
-| `StockReserved v1` | Stock | Commande | quantité, `adresse_chargement` | Commande confirmée |
-| `StockRejected v1` | Stock | Commande | quantité demandée, quantité disponible | Commande refusée |
-| `OrderConfirmed v1` | Commande | Livraison | `adresse`, `adresse_chargement` | Crée la livraison |
-| `OrderCancelled v1` | Commande | Stock, Livraison | motif | Libère le stock, annule la livraison |
-| `DeliveryShipped v1` | Livraison | Commande | transporteur, date prévue | Commande expédiée |
-| `DeliveryCompleted v1` | Livraison | Commande | date de livraison | Commande livrée |
+| `OrderCreated` | Commande | Stock, Livraison, Query | commande complète | lignes + adresse → **crée le réplica** dans Livraison |
+| `StockReserved` | Stock | Commande, Livraison, Query | `status` de la commande | `CONFIRMED` |
+| `StockRejected` | Stock | Commande, Query | `status` de la commande | `REJECTED` |
+| `DeliveryAddressChanged` | Commande | Livraison, Query | `deliveryAddress` | nouvelle adresse → **met à jour le réplica** |
+| `OrderShipped` | Livraison | Commande, Query | `status` de la commande | `SHIPPED` |
 
-## Contenu des agrégats
+### Réplica de la Commande dans le service Livraison
 
-**Commande** (clé `orderId`)
-- Propre : client, `productId`, quantité, prix, montant, `adresse`, statut (en attente, confirmée, refusée, annulée, expédiée, livrée)
-- Copies : `adresse_chargement` (source Stock), transporteur et dates (source Livraison)
+Le service Livraison ne garde que les données de la commande dont il a besoin. Le réplica est **créé** par `OrderCreated` et **mis à jour** par `DeliveryAddressChanged` et `StockReserved`.
 
-**Stock** (clé `productId`)
-- Propre : nom du produit, quantité disponible, quantité réservée, adresse de l'entrepôt
-- Copies : réservations en cours (`orderId`, quantité ; source Commande)
-- Invariant : quantité disponible ≥ 0
+```json
+{
+  "orderId": "CMD-43",
+  "deliveryAddress": "5 avenue Foch, 75016 Paris",
+  "itemsCount": 2,
+  "orderStatus": "CONFIRMED",
+  "lastEventId": "uuid"
+}
+```
 
-**Livraison** (clé `deliveryId`)
-- Propre : transporteur, statut (à préparer, expédiée, livrée, annulée), date prévue, date de livraison
-- Copies : `orderId`, `adresse`, `adresse_chargement` (source Commande)
+### Traitement fiable d'un événement (file ready / processing)
 
-## Rôle de chaque base
+1. `LMOVE <service>:ready <service>:processing LEFT RIGHT` : le service prend l'événement, déplacé de façon atomique.
+2. Traitement métier + enregistrement de l'`eventId`.
+3. `LREM <service>:processing 1 <event>` : acquittement.
+4. En cas de crash avant l'acquittement : `LMOVE <service>:processing <service>:ready RIGHT LEFT` remet l'événement en tête de file. Le contrôle de l'`eventId` évite un double traitement.
 
-| Base | Modèle | Rôle | Clé |
-|---|---|---|---|
-| PostgreSQL | Relationnel | Source de vérité des trois agrégats | `orderId`, `productId`, `deliveryId` |
-| Redis | Clé-valeur | Transport des événements (Lists) ; lecture rapide du stock disponible | `stock:{productId}:available` |
-| MongoDB | Document | Vue « suivi de commande » : commande, réservation et livraison en un seul document | `orderId` |
-| Bigtable | Colonnes larges | Historique des événements par produit et par jour | `productId#jour#horodatage_inversé#eventId` |
-| Neo4j | Graphe | Produits commandés par les clients ayant commandé le même produit | Nœuds Client, Produit ; relation `A_COMMANDÉ` |
+---
 
-Les quatre bases NoSQL sont des vues dérivées des événements, reconstructibles, jamais des sources de vérité.
+## Étape 5 – Projection
 
-## Règles indispensables
+Le service Query consomme tous les événements et construit une **vue dénormalisée** prête à afficher (écran « Mes commandes »), sans interroger les autres services.
 
-- **Un service, un agrégat, une transaction** : aucun service n'écrit dans la base d'un autre.
-- **Anti-survente** : vérification et décrément du stock dans la même transaction locale ; refus avec la quantité restante.
-- **Commande en attente** : réponse immédiate au client, confirmation ou refus après traitement par le Stock.
-- **Une commande = un produit** : la réservation ne touche qu'un seul agrégat Stock.
-- **Routeur obligatoire** : une List Redis ne diffuse pas ; le routeur recopie chaque événement dans une List par consommateur.
-- **Idempotence** : `eventId` unique chez chaque consommateur ; un événement reçu deux fois n'a qu'un effet.
-- **Duplication** : chaque copie a une source de vérité ; correction par un nouvel événement versionné.
-- **Double écriture** : agrégat et événement enregistrés dans la même transaction (table outbox), publication ensuite.
+```json
+{
+  "orderId": "CMD-43",
+  "customerId": "CLI-8",
+  "total": 50,
+  "status": "SHIPPED",
+  "deliveryAddress": "5 avenue Foch, 75016 Paris",
+  "carrier": "Colissimo",
+  "updatedAt": "2026-10-26T14:00:00Z"
+}
+```
 
-## Origine des données
+---
 
-| Donnée | Origine |
+## Stockage des agrégats dans Redis
+
+Consigne : stocker les 3 agrégats dans Redis, en ligne de commande, avec un Redis persistant.
+
+### Choix de modélisation
+
+Chaque agrégat est stocké dans un **Hash** : un objet plat dont les champs se lisent et se modifient indépendamment (`HGET`, `HMGET`, `HSET`, `HINCRBY`). Les lignes de commande étant une liste imbriquée, elles sont stockées dans un Hash séparé (champ = produit, valeur = quantité).
+
+| Clé Redis | Type | Contenu |
+|---|---|---|
+| `shop:order:<orderId>` | Hash | en-tête de la commande |
+| `shop:order:<orderId>:lines` | Hash | `productId` → quantité |
+| `shop:stock:<productId>` | Hash | stock disponible et réservé |
+| `shop:delivery:<deliveryId>` | Hash | livraison |
+
+Toutes les clés sont préfixées par `shop:` (namespace du projet) et n'ont **pas de TTL** (`TTL` = `-1`) : ce sont des données métier qui ne doivent pas expirer.
+
+### Connexion
+
+```bash
+docker compose -f docker-compose.dev.yml exec redis redis-cli
+```
+
+### 1. Agrégat Commande (CMD-42)
+
+```redis
+HSET shop:order:CMD-42 orderId CMD-42 customerId CLI-7 deliveryAddress "12 rue de Paris, 94120 Fontenay" total 250 status PENDING
+# (integer) 5 → 5 champs créés
+HSET shop:order:CMD-42:lines PROD-12 10
+# (integer) 1
+HMGET shop:order:CMD-42 status deliveryAddress
+# 1) "PENDING"  2) "12 rue de Paris, 94120 Fontenay"
+TYPE shop:order:CMD-42   # hash
+HLEN shop:order:CMD-42   # (integer) 5
+TTL shop:order:CMD-42    # (integer) -1 → persistant
+```
+
+### 2. Agrégat Stock (PROD-12)
+
+```redis
+HSET shop:stock:PROD-12 productId PROD-12 available 3 reserved 0
+# (integer) 3
+HGETALL shop:stock:PROD-12
+# productId PROD-12 / available 3 / reserved 0
+```
+
+### 3. Agrégat Livraison (via la commande valide CMD-43)
+
+```redis
+# Commande valide de 2 articles
+HSET shop:order:CMD-43 orderId CMD-43 customerId CLI-8 deliveryAddress "5 avenue Foch, 75016 Paris" total 50 status PENDING
+HSET shop:order:CMD-43:lines PROD-12 2
+
+# Réservation du stock : succès
+HINCRBY shop:stock:PROD-12 available -2   # (integer) 1 → résultat positif = stock suffisant
+HINCRBY shop:stock:PROD-12 reserved 2     # (integer) 2
+HSET shop:order:CMD-43 status CONFIRMED   # (integer) 0 → champ existant mis à jour
+
+# Création de la livraison
+HSET shop:delivery:LIV-43 deliveryId LIV-43 orderId CMD-43 carrier "" status WAITING
+# (integer) 4
+
+# Expédition
+HSET shop:delivery:LIV-43 carrier Colissimo status SHIPPED   # (integer) 0
+HSET shop:order:CMD-43 status SHIPPED                        # (integer) 0
+```
+
+### État final
+
+```redis
+SCAN 0 MATCH shop:* COUNT 100
+# shop:order:CMD-42, shop:order:CMD-42:lines,
+# shop:order:CMD-43, shop:order:CMD-43:lines,
+# shop:stock:PROD-12, shop:delivery:LIV-43
+
+HGETALL shop:stock:PROD-12     # available 1 / reserved 2
+HMGET shop:order:CMD-43 status # "SHIPPED"
+HGETALL shop:delivery:LIV-43   # carrier Colissimo / status SHIPPED
+```
+
+> `HSET` renvoie le nombre de **champs créés**, pas le nombre de valeurs modifiées : d'où `(integer) 0` lors d'une mise à jour de statut.
+
+---
+
+## Gestion de la survente
+
+Cas testé : la commande **CMD-42 demande 10 articles alors que seulement 3 sont disponibles**.
+
+```redis
+HINCRBY shop:stock:PROD-12 available -10   # (integer) -7 → négatif = stock insuffisant
+HINCRBY shop:stock:PROD-12 available 10    # (integer) 3  → réservation annulée (compensation)
+HSET shop:order:CMD-42 status REJECTED     # (integer) 0
+```
+
+`HINCRBY` est **atomique** : deux commandes simultanées ne peuvent pas réserver le même article, car chaque décrément est appliqué l'un après l'autre et renvoie la nouvelle valeur. Si le résultat est négatif, la réservation est annulée et la commande est refusée (`StockRejected`).
+
+---
+
+## Persistance de Redis
+
+Configuration dans `docker-compose.dev.yml` :
+
+```yaml
+redis:
+  image: redis:7-alpine
+  ports:
+    - "6380:6379"        # 6380 sur la machine (6379 déjà utilisé par le projet de l'enseignant)
+  volumes:
+    - redis-data:/data   # volume nommé : les fichiers de persistance survivent au conteneur
+  command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+```
+
+| Option | Rôle |
 |---|---|
-| Produits et stock | Script d'initialisation, puis commandes d'administration |
-| Commandes | Appels REST du client (manuels ou simulés) |
-| Livraisons | Événement `OrderConfirmed`, puis appels du transporteur |
-| Copies locales et vues NoSQL | Événements uniquement |
+| `--appendonly yes` | active l'**AOF** : chaque écriture est journalisée sur disque et rejouée au redémarrage |
+| `redis-data:/data` | le journal est stocké dans un volume Docker nommé |
+| `--maxmemory-policy noeviction` | Redis n'**évince aucune clé** sous pression mémoire : aucun agrégat ni aucune file d'événements n'est perdu |
 
-## Structure du projet
+Vérification :
 
-```
-ecommerce-nosql/
-├── README.md
-├── .gitignore
-├── .env.dev                      # ports, mots de passe locaux
-├── docker-compose.dev.yml        # bases, routeur, services
-│
-├── contracts/                    # contrats partagés, écrits avant tout code
-│   ├── events/
-│   │   ├── order-placed/v1/
-│   │   │   ├── schema.json
-│   │   │   └── examples/order-placed.json
-│   │   ├── stock-reserved/v1/
-│   │   ├── stock-rejected/v1/
-│   │   ├── order-confirmed/v1/
-│   │   ├── order-cancelled/v1/
-│   │   ├── delivery-shipped/v1/
-│   │   └── delivery-completed/v1/
-│   └── subscriptions/            # un fichier par couple consommateur + événement
-│       ├── stock-service--order-placed.json
-│       ├── order-service--stock-reserved.json
-│       └── ...
-│
-├── order-service/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── migrations/               # tables : orders, outbox, processed_events
-│   ├── src/order_service/
-│   │   ├── api.py                # points d'entrée REST
-│   │   ├── domain.py             # agrégat Commande et ses règles
-│   │   ├── repository.py         # accès PostgreSQL
-│   │   ├── publisher.py          # outbox vers Redis
-│   │   └── consumer.py           # lecture de sa List, idempotence
-│   └── tests/
-├── stock-service/                # même structure, agrégat Stock
-├── delivery-service/             # même structure, agrégat Livraison
-│
-├── event-router/                 # routeur d'événements
-│
-├── projector/
-│   ├── Dockerfile
-│   ├── pyproject.toml
-│   ├── src/projector/
-│   │   ├── consumer.py
-│   │   ├── mongo_view.py         # suivi de commande
-│   │   ├── bigtable_view.py      # historique par produit et jour
-│   │   ├── neo4j_view.py         # clients et produits
-│   │   └── redis_view.py         # stock disponible
-│   └── tests/
-│
-├── data/
-│   └── products.csv              # produits de départ
-├── scripts/
-│   ├── seed_products.py          # charge products.csv via l'API Stock
-│   └── simulate_orders.py        # envoie des commandes de test
-└── docs/
-    ├── adr/                      # décisions d'architecture
-    └── diagrams/
+```redis
+CONFIG GET appendonly          # "yes"
+CONFIG GET maxmemory-policy    # "noeviction"
 ```
 
-## Étapes de réalisation
+### Test de redémarrage
 
-- [ ] 1. État SQL : trois services REST avec leur agrégat dans PostgreSQL
-- [ ] 2. Redis Lists : publication des événements, routeur, consommateurs idempotents
-- [ ] 3. Projections NoSQL : MongoDB, Bigtable, Neo4j, Redis clé-valeur
+```bash
+docker compose -f docker-compose.dev.yml restart redis
+docker compose -f docker-compose.dev.yml exec redis redis-cli SCAN 0 MATCH "shop:*" COUNT 100
+```
+
+Les 6 clés sont toujours présentes après le redémarrage : les données sont rejouées depuis l'AOF stocké dans le volume.
+
+> `docker compose down -v` supprimerait le volume `redis-data` et donc toutes les données. Pour arrêter le projet sans perte : `docker compose down` (sans `-v`).
+
+---
+
+## Lancer le projet
+
+Prérequis : Docker Desktop.
+
+```bash
+git clone <url-du-depot>
+cd E-commerce-projet-Nosql-
+docker compose -f docker-compose.dev.yml up -d     # démarre Redis et MongoDB
+docker compose -f docker-compose.dev.yml ps        # shop-redis et shop-mongodb : healthy
+docker compose -f docker-compose.dev.yml exec redis redis-cli PING   # PONG
+```
+
+---
+
+## Arborescence
+
+```
+E-commerce-projet-Nosql-/
+├── README.md                 # ce descriptif
+├── docker-compose.dev.yml    # infrastructure : Redis + MongoDB
+├── settings.gradle           # déclaration des services
+├── docs/
+│   └── events/               # contrats JSON des événements
+├── orderService/             # service Commande
+├── stockService/             # service Stock
+├── deliveryService/          # service Livraison
+├── orderQueryService/        # service Query (projection)
+└── event-router/             # routeur d'événements Redis (fan-out)
+```
