@@ -143,7 +143,7 @@ Le service Livraison ne garde que les données de la commande dont il a besoin. 
 ```
 ---
 
-## Étape 9 – Événements et réplica en ligne de commande
+## – Événements et réplica en ligne de commande
 
 Les événements circulent dans des **Lists Redis**, selon le protocole du cours : publication → routeur (fan-out) → une file `ready` par service → traitement → acquittement.
 
@@ -291,7 +291,7 @@ LRANGE shop:events:archive 0 9
 
 ---
 
-## Étape 10 – Projection en ligne de commande
+## – Projection en ligne de commande
 
 Le service Query consomme les événements de sa file `shop:query:ready` et construit une **vue dénormalisée** `shop:query:order-view:<orderId>` (Hash), lisible en une seule requête, sans interroger les autres services.
 
