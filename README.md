@@ -295,12 +295,15 @@ CONFIG GET maxmemory-policy    # "noeviction"
 ```
 
 ### Test de redémarrage
+#### Persistance avant
+![Avant redémarrage](images/persistance-avant.png)
 
 ```bash
 docker compose -f docker-compose.dev.yml restart redis
 docker compose -f docker-compose.dev.yml exec redis redis-cli SCAN 0 MATCH "shop:*" COUNT 100
 ```
-
+#### Persistanace apres
+![Après redémarrage](images/persistance-apres.png)
 Les 6 clés sont toujours présentes après le redémarrage : les données sont rejouées depuis l'AOF stocké dans le volume.
 
 > `docker compose down -v` supprimerait le volume `redis-data` et donc toutes les données. Pour arrêter le projet sans perte : `docker compose down` (sans `-v`).
