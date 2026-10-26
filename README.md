@@ -49,7 +49,7 @@ L'application est découpée en services. Chaque service **possède son propre a
 | **Query** (`orderQueryService`) | construit une vue consolidée pour l'affichage client | Projection `order_views` |
 
 ### Architecture
-![Architecture de l'application](images/architecture.png)
+![Architecture de l'application](images/Architecture.png)
 
 Comme dans le projet de l'enseignant, **Redis coordonne la livraison des événements** entre services. Le routeur copie chaque événement dans **une file par service consommateur**, car une List Redis est consommée de façon destructive (`LPOP` / `LMOVE`) : avec une file partagée, un événement ne serait reçu que par un seul service.
 
