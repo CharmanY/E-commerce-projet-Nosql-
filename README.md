@@ -141,6 +141,197 @@ Le service Livraison ne garde que les données de la commande dont il a besoin. 
   "lastEventId": "uuid"
 }
 ```
+---
+
+## Étape 9 – Événements et réplica en ligne de commande
+
+Les événements circulent dans des **Lists Redis**, selon le protocole du cours : publication → routeur (fan-out) → une file `ready` par service → traitement → acquittement.
+
+### Clés utilisées
+
+| Clé | Type | Rôle |
+|---|---|---|
+| `shop:events:published` | List | événements publiés par les services émetteurs |
+| `shop:router:processing` | List | événement en cours de routage |
+| `shop:<service>:ready` | List | file d'attente d'un service consommateur (`order`, `stock`, `delivery`, `query`) |
+| `shop:<service>:processing` | List | événement en cours de traitement par un service |
+| `shop:<service>:processed` | Set | `eventId` déjà traités (**idempotence**) |
+| `shop:events:archive` | List | journal non consommé de tous les événements (relecture, visualisation RedisInsight) |
+| `shop:delivery:replica:<orderId>` | Hash | **réplica** de la commande dans le service Livraison |
+
+### Protocole de traitement d'un événement
+
+```redis
+LMOVE shop:<service>:ready shop:<service>:processing LEFT RIGHT
+SADD shop:<service>:processed <eventId>
+HSET <clé de l'agrégat ou du réplica> <champ> <valeur>
+LREM shop:<service>:processing 1 '<event>'
+```
+
+- `LMOVE` est atomique : l'événement est toujours soit dans `ready`, soit dans `processing`, jamais perdu.
+- `SADD` renvoie `1` si l'`eventId` est nouveau (on traite), `0` s'il a déjà été traité (on ignore).
+- `LREM` acquitte l'événement une fois le traitement terminé.
+- En cas de crash avant `LREM`, l'événement est remis en tête de file avec `LMOVE shop:<service>:processing shop:<service>:ready RIGHT LEFT`.
+
+### Scénario réalisé : commande CMD-44
+
+| Événement | Émetteur | Routé vers | Effet |
+|---|---|---|---|
+| `evt-001` `OrderCreated` | Commande | Stock, Livraison, Query | Stock réservé (`available 1 → 0`, `reserved 2 → 3`) ; **réplica créé** |
+| `evt-002` `StockReserved` | Stock | Commande, Livraison, Query | Commande `PENDING → CONFIRMED` ; réplica `orderStatus CONFIRMED` |
+| `evt-003` `DeliveryAddressChanged` | Commande | Livraison, Query | **réplica mis à jour** avec la nouvelle adresse |
+
+#### 1. `OrderCreated` : création du réplica
+
+```redis
+# Service Commande : agrégat + publication
+HSET shop:order:CMD-44 orderId CMD-44 customerId CLI-9 total 25 status PENDING
+HSET shop:order:CMD-44 deliveryAddress "8 rue Lafayette, 75009 Paris"
+HSET shop:order:CMD-44:lines PROD-12 1
+RPUSH shop:events:published '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+
+# Routeur : fan-out + archive
+LMOVE shop:events:published shop:router:processing LEFT RIGHT
+RPUSH shop:stock:ready '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+RPUSH shop:delivery:ready '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+RPUSH shop:query:ready '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+RPUSH shop:events:archive '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+LREM shop:router:processing 1 '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+
+# Service Livraison : création du réplica
+LMOVE shop:delivery:ready shop:delivery:processing LEFT RIGHT
+SADD shop:delivery:processed evt-001
+HSET shop:delivery:replica:CMD-44 orderId CMD-44 itemsCount 1 orderStatus PENDING lastEventId evt-001
+HSET shop:delivery:replica:CMD-44 deliveryAddress "8 rue Lafayette, 75009 Paris"
+LREM shop:delivery:processing 1 '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+
+# Service Stock : réservation atomique
+LMOVE shop:stock:ready shop:stock:processing LEFT RIGHT
+SADD shop:stock:processed evt-001
+HINCRBY shop:stock:PROD-12 available -1
+HINCRBY shop:stock:PROD-12 reserved 1
+LREM shop:stock:processing 1 '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+```
+
+![OrderCreated et création du réplica](images/etape9-order-created.png)
+
+#### 2. `StockReserved` : confirmation de la commande
+
+```redis
+RPUSH shop:events:published '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+
+# Routeur
+LMOVE shop:events:published shop:router:processing LEFT RIGHT
+RPUSH shop:order:ready '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+RPUSH shop:delivery:ready '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+RPUSH shop:query:ready '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+RPUSH shop:events:archive '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+LREM shop:router:processing 1 '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+
+# Service Commande
+LMOVE shop:order:ready shop:order:processing LEFT RIGHT
+SADD shop:order:processed evt-002
+HSET shop:order:CMD-44 status CONFIRMED
+LREM shop:order:processing 1 '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+
+# Service Livraison : mise à jour du réplica
+LMOVE shop:delivery:ready shop:delivery:processing LEFT RIGHT
+SADD shop:delivery:processed evt-002
+HSET shop:delivery:replica:CMD-44 orderStatus CONFIRMED lastEventId evt-002
+LREM shop:delivery:processing 1 '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+```
+
+#### 3. `DeliveryAddressChanged` : mise à jour du réplica
+
+```redis
+# Service Commande : modification de son agrégat + publication
+HSET shop:order:CMD-44 deliveryAddress "20 rue Oberkampf, 75011 Paris"
+RPUSH shop:events:published '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+
+# Routeur (le service Stock n'est pas concerné)
+LMOVE shop:events:published shop:router:processing LEFT RIGHT
+RPUSH shop:delivery:ready '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+RPUSH shop:query:ready '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+RPUSH shop:events:archive '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+LREM shop:router:processing 1 '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+
+# Service Livraison : mise à jour du réplica
+LMOVE shop:delivery:ready shop:delivery:processing LEFT RIGHT
+SADD shop:delivery:processed evt-003
+HSET shop:delivery:replica:CMD-44 deliveryAddress "20 rue Oberkampf, 75011 Paris" lastEventId evt-003
+LREM shop:delivery:processing 1 '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+```
+
+#### 4. Test d'idempotence : l'événement evt-003 est livré deux fois
+
+```redis
+RPUSH shop:delivery:ready '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+LMOVE shop:delivery:ready shop:delivery:processing LEFT RIGHT
+SADD shop:delivery:processed evt-003
+# (integer) 0 → déjà traité : le réplica n'est pas modifié
+LREM shop:delivery:processing 1 '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+```
+
+#### Résultat
+
+```redis
+HGETALL shop:order:CMD-44
+# status CONFIRMED / deliveryAddress "20 rue Oberkampf, 75011 Paris"
+HGETALL shop:delivery:replica:CMD-44
+# orderStatus CONFIRMED / deliveryAddress "20 rue Oberkampf, 75011 Paris" / lastEventId evt-003
+SMEMBERS shop:delivery:processed
+# evt-001, evt-002, evt-003
+LRANGE shop:events:archive 0 9
+# les 3 événements
+```
+
+![StockReserved, DeliveryAddressChanged et idempotence](images/etape9-replica-update.png)
+
+> **Incident observé** : à cause d'un bug d'affichage de Git Bash lors d'un copier-coller, `evt-001` a été publié deux fois. La copie restée dans `shop:router:processing` a été supprimée avec `LREM shop:router:processing 0 '<event>'` (`count = 0` supprime toutes les occurrences). Ce cas de double publication est exactement celui que l'idempotence par `eventId` protège.
+
+---
+
+## Étape 10 – Projection en ligne de commande
+
+Le service Query consomme les événements de sa file `shop:query:ready` et construit une **vue dénormalisée** `shop:query:order-view:<orderId>` (Hash), lisible en une seule requête, sans interroger les autres services.
+
+```redis
+# evt-001 OrderCreated → création de la vue
+LMOVE shop:query:ready shop:query:processing LEFT RIGHT
+SADD shop:query:processed evt-001
+HSET shop:query:order-view:CMD-44 orderId CMD-44 customerId CLI-9 total 25 status PENDING lastEventId evt-001
+HSET shop:query:order-view:CMD-44 deliveryAddress "8 rue Lafayette, 75009 Paris"
+LREM shop:query:processing 1 '{"eventId":"evt-001","type":"OrderCreated","aggregateId":"CMD-44","quantity":1}'
+
+# evt-002 StockReserved → statut confirmé
+LMOVE shop:query:ready shop:query:processing LEFT RIGHT
+SADD shop:query:processed evt-002
+HSET shop:query:order-view:CMD-44 status CONFIRMED lastEventId evt-002
+LREM shop:query:processing 1 '{"eventId":"evt-002","type":"StockReserved","aggregateId":"CMD-44"}'
+
+# evt-003 DeliveryAddressChanged → nouvelle adresse
+LMOVE shop:query:ready shop:query:processing LEFT RIGHT
+SADD shop:query:processed evt-003
+HSET shop:query:order-view:CMD-44 deliveryAddress "20 rue Oberkampf, 75011 Paris" lastEventId evt-003
+LREM shop:query:processing 1 '{"eventId":"evt-003","type":"DeliveryAddressChanged","aggregateId":"CMD-44"}'
+```
+
+### Vue finale
+
+| Champ | Valeur |
+|---|---|
+| `orderId` | CMD-44 |
+| `customerId` | CLI-9 |
+| `total` | 25 |
+| `status` | CONFIRMED |
+| `deliveryAddress` | 20 rue Oberkampf, 75011 Paris |
+| `lastEventId` | evt-003 |
+
+Toutes les files `ready` et `processing` sont vides en fin de scénario : chaque événement a été traité et acquitté.
+
+![Projection order-view](images/etape10-projection.png)
+
+> **Limite de la simulation en CLI** : les événements utilisés ici sont minimalistes. Dans les services, `OrderCreated` transportera dans son payload `customerId`, `total` et `deliveryAddress`, afin que le service Query construise la vue uniquement à partir des événements.
 
 ### Traitement fiable d'un événement (file ready / processing)
 
